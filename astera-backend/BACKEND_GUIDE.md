@@ -65,7 +65,7 @@ astera-backend/
 | `FRONTEND_URL` | `http://localhost:3000` | Allowed CORS origin |
 | `HOST` | `0.0.0.0` | Uvicorn bind host |
 | `PORT` | `8000` | Uvicorn port |
-| `GEMINI_JUDGE_MODEL` | `gemini-2.0-flash` | Model used by llm_judge (optional, has default) |
+| `GEMINI_JUDGE_MODEL` | `gemini-3.1-flash-lite` | Model used by llm_judge (optional, has default) |
 
 ---
 

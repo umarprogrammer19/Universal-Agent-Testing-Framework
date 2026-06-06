@@ -14,7 +14,7 @@ load_dotenv()
 class GeminiAdapter(BaseAgentAdapter):
     """Adapter that wraps Google Gemini 2.0 Flash via the google-genai SDK."""
 
-    _MODEL_NAME = "gemini-2.0-flash"
+    _MODEL_NAME = "gemini-3.1-flash-lite"
     _DISPLAY_NAME = "Gemini 2.0 Flash"
 
     def __init__(self) -> None:

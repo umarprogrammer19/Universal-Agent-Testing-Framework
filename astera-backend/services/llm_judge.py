@@ -65,7 +65,7 @@ Label rules:
     try:
         import asyncio
         client = _get_client()
-        model = os.getenv("GEMINI_JUDGE_MODEL", "gemini-2.0-flash")
+        model = os.getenv("GEMINI_JUDGE_MODEL", "gemini-3.1-flash-lite")
 
         response = await asyncio.to_thread(
             client.models.generate_content,
