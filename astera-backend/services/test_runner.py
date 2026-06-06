@@ -1,171 +1,111 @@
 """
 services/test_runner.py
 
-Orchestrates test-suite execution across one or multiple LLM adapters.
-Each model gets its own Run record so the frontend can render a
-side-by-side comparison without any ambiguity about which results
-belong to which model.
+Executes a single Run record that already exists in the DB.
+routes/runs.py creates one Run per model and fires execute_run(run.id)
+for each — this function works with that exact run, saves TestResult
+records against it, and updates its status/counters when done.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy.ext.asyncio import AsyncSession
-
-# Internal imports — these modules will be created separately
-from database import get_db_session                          # async session factory
-from models import Run, TestSuite, TestCase, TestResult     # ORM models
+from db.database import SessionLocal
+from db.models import Run, TestSuite, TestCase, TestResult
 from services.adapters.factory import AdapterFactory
-from services.judge import judge_response                    # LLM-as-judge scorer
+from services.judge import judge_response
 
 logger = logging.getLogger(__name__)
 
-# Models the framework knows how to test
 SUPPORTED_MODELS: list[str] = ["gemini", "gpt-4", "claude"]
 
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# Public entry point — called as a FastAPI BackgroundTask
 # ---------------------------------------------------------------------------
 
-async def execute_run(run_id: str) -> dict[str, Any]:
+async def execute_run(run_id: str) -> None:
     """
-    Execute a test run (single-model or multi-model).
+    Drive one Run to completion.
 
-    Parameters
-    ----------
-    run_id : str
-        Primary key of the Run record that was created when the user
-        triggered this execution.
-
-    Returns
-    -------
-    {
-        'run_ids': [str, ...],          # one per model tested
-        'model_results': {
-            '<model>': {
-                'run_id': str,
-                'pass_count': int,
-                'fail_count': int,
-                'total_tokens': int,
-            },
-            ...
-        }
-    }
+    1. Load the Run (already created by the route) and its suite's test cases.
+    2. Create the right adapter for run.model_type.
+    3. Execute every test case, persist TestResult records.
+    4. Update run.pass_count / fail_count / total_tokens / status.
     """
-    async with get_db_session() as session:
-        # ── 1. Fetch the triggering Run from DB ──────────────────────────
-        run: Run = await _fetch_run(session, run_id)
-        suite: TestSuite = await _fetch_suite(session, run.suite_id)
-        test_cases: list[TestCase] = await _fetch_test_cases(session, suite.id)
+    db = SessionLocal()
+    try:
+        # ── Fetch run ──────────────────────────────────────────────────────
+        run: Run | None = db.query(Run).filter(Run.id == run_id).first()
+        if run is None:
+            logger.error("execute_run: Run %s not found", run_id)
+            return
 
-        # ── 2. Decide which models to test ───────────────────────────────
-        if run.multi_model_test and run.models_to_test:
-            models_to_run: list[str] = run.models_to_test
-        else:
-            models_to_run = [run.model_type]
+        run.status = "running"
+        db.commit()
 
-        # ── 3. Execute each model (concurrently to reduce wall-clock time) ─
-        tasks = [
-            _run_single_model(
-                session=session,
-                parent_run=run,
-                suite=suite,
-                test_cases=test_cases,
-                model_name=model_name,
+        # ── Fetch test cases ───────────────────────────────────────────────
+        test_cases: list[TestCase] = (
+            db.query(TestCase)
+            .filter(TestCase.suite_id == run.suite_id)
+            .order_by(TestCase.order_index)
+            .all()
+        )
+        if not test_cases:
+            logger.warning("execute_run: Suite %s has no test cases", run.suite_id)
+            run.status = "failed"
+            db.commit()
+            return
+
+        # ── Create adapter ─────────────────────────────────────────────────
+        adapter = await AdapterFactory.create(run.model_type)
+
+        # ── Execute each test case ─────────────────────────────────────────
+        pass_count = 0
+        fail_count = 0
+        total_tokens = 0
+
+        for test_case in test_cases:
+            result = await _execute_test_case(
+                db=db,
+                run=run,
+                test_case=test_case,
+                adapter=adapter,
+                model_name=run.model_type,
             )
-            for model_name in models_to_run
-        ]
-        model_summaries: list[dict[str, Any]] = await asyncio.gather(*tasks)
+            total_tokens += result.token_usage or 0
+            if result.passed:
+                pass_count += 1
+            else:
+                fail_count += 1
 
-        # ── 4. Mark the parent run as completed ──────────────────────────
+        # ── Update run ─────────────────────────────────────────────────────
+        run.pass_count = pass_count
+        run.fail_count = fail_count
+        run.total_tokens = total_tokens
         run.status = "completed"
         run.completed_at = datetime.now(timezone.utc)
-        await session.commit()
+        db.commit()
 
-    # ── 5. Build response for the API layer ──────────────────────────────
-    run_ids = [s["run_id"] for s in model_summaries]
-    model_results = {s["model"]: s for s in model_summaries}
-
-    return {"run_ids": run_ids, "model_results": model_results}
-
-
-# ---------------------------------------------------------------------------
-# Per-model execution
-# ---------------------------------------------------------------------------
-
-async def _run_single_model(
-    session: AsyncSession,
-    parent_run: Run,
-    suite: TestSuite,
-    test_cases: list[TestCase],
-    model_name: str,
-) -> dict[str, Any]:
-    """
-    Create a child Run record, execute every test case against *model_name*,
-    persist results, and return a summary dict.
-    """
-    # ── a. Create adapter ─────────────────────────────────────────────────
-    adapter = await AdapterFactory.create(model_name)
-    display_name = await adapter.get_model_name()
-    logger.info("Starting run for model=%s (%s)", model_name, display_name)
-
-    # ── b. Create a child Run record in DB ────────────────────────────────
-    child_run = Run(
-        suite_id=suite.id,
-        model_type=model_name,
-        model_display_name=display_name,
-        parent_run_id=parent_run.id,
-        status="running",
-        started_at=datetime.now(timezone.utc),
-        multi_model_test=False,   # child runs are always single-model
-    )
-    session.add(child_run)
-    await session.flush()         # get child_run.id without committing
-
-    # ── c. Execute each test case ─────────────────────────────────────────
-    pass_count = 0
-    fail_count = 0
-    total_tokens = 0
-
-    for test_case in test_cases:
-        result = await _execute_test_case(
-            session=session,
-            run=child_run,
-            test_case=test_case,
-            adapter=adapter,
-            model_name=model_name,
+        logger.info(
+            "Run %s completed | model=%s pass=%d fail=%d tokens=%d",
+            run_id, run.model_type, pass_count, fail_count, total_tokens,
         )
-        total_tokens += result.token_usage or 0
-        if result.passed:
-            pass_count += 1
-        else:
-            fail_count += 1
 
-    # ── e. Update child Run record ────────────────────────────────────────
-    child_run.pass_count = pass_count
-    child_run.fail_count = fail_count
-    child_run.total_tokens = total_tokens
-    child_run.status = "completed"
-    child_run.completed_at = datetime.now(timezone.utc)
-    await session.commit()
-
-    logger.info(
-        "Completed run for model=%s | pass=%d fail=%d tokens=%d",
-        model_name, pass_count, fail_count, total_tokens,
-    )
-
-    return {
-        "model": model_name,
-        "run_id": str(child_run.id),
-        "pass_count": pass_count,
-        "fail_count": fail_count,
-        "total_tokens": total_tokens,
-    }
+    except Exception:
+        logger.exception("execute_run crashed for run_id=%s", run_id)
+        try:
+            run = db.query(Run).filter(Run.id == run_id).first()
+            if run:
+                run.status = "failed"
+                db.commit()
+        except Exception:
+            pass
+    finally:
+        db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -173,26 +113,26 @@ async def _run_single_model(
 # ---------------------------------------------------------------------------
 
 async def _execute_test_case(
-    session: AsyncSession,
+    db: Any,
     run: Run,
     test_case: TestCase,
     adapter: Any,
     model_name: str,
 ) -> TestResult:
-    """
-    Run one test case, compare the trace, optionally judge the response,
-    and persist a TestResult record.
-    """
-    # ── d-i. Call adapter ─────────────────────────────────────────────────
+    """Run one test case, assert, judge, persist."""
+
+    # ── Call adapter ───────────────────────────────────────────────────────
     try:
         adapter_output: dict = await adapter.run_with_trace(
             prompt=test_case.prompt,
             tools=test_case.tools or [],
         )
-    except Exception as exc:                                # adapter error
-        logger.exception("Adapter error on test_case=%s model=%s", test_case.id, model_name)
-        return await _persist_result(
-            session=session,
+    except Exception as exc:
+        logger.exception(
+            "Adapter error on test_case=%s model=%s", test_case.id, model_name
+        )
+        return _persist_result(
+            db=db,
             run=run,
             test_case=test_case,
             model_name=model_name,
@@ -202,22 +142,22 @@ async def _execute_test_case(
             passed=False,
             assertion_details={"error": str(exc)},
             semantic_score=None,
-            judge_explanation=f"Adapter raised an exception: {exc}",
+            judge_explanation=f"Adapter error: {exc}",
         )
 
-    final_response: str = adapter_output["final_response"]
-    execution_trace: list[dict] = adapter_output["execution_trace"]
-    token_usage: int = adapter_output["token_usage"]
+    final_response: str = adapter_output.get("final_response", "")
+    execution_trace: list[dict] = adapter_output.get("execution_trace", [])
+    token_usage: int = adapter_output.get("token_usage", 0)
 
-    # ── d-ii. Assertion engine — compare actual vs expected tool sequence ─
+    # ── Assertion engine ───────────────────────────────────────────────────
     passed, assertion_details = _run_assertions(
         execution_trace=execution_trace,
         expected_tools=test_case.expected_tools or [],
-        expected_output=test_case.expected_output,
+        expected_output=getattr(test_case, "expected_output", None),
         final_response=final_response,
     )
 
-    # ── d-iii. LLM-as-judge (only when a golden response is provided) ─────
+    # ── LLM judge (only when golden_response is set) ───────────────────────
     semantic_score: float | None = None
     judge_explanation: str | None = None
 
@@ -234,9 +174,9 @@ async def _execute_test_case(
             logger.warning("Judge failed for test_case=%s: %s", test_case.id, exc)
             judge_explanation = f"Judge error: {exc}"
 
-    # ── d-iv. Persist TestResult ──────────────────────────────────────────
-    return await _persist_result(
-        session=session,
+    # ── Persist ────────────────────────────────────────────────────────────
+    return _persist_result(
+        db=db,
         run=run,
         test_case=test_case,
         model_name=model_name,
@@ -260,12 +200,7 @@ def _run_assertions(
     expected_output: str | None,
     final_response: str,
 ) -> tuple[bool, dict]:
-    """
-    Compare the actual tool-call sequence against expectations.
 
-    Returns (passed: bool, details: dict) — details is stored in the DB
-    so engineers can diagnose failures without re-running.
-    """
     details: dict[str, Any] = {
         "tool_sequence_match": True,
         "missing_tools": [],
@@ -274,46 +209,46 @@ def _run_assertions(
         "output_match": None,
     }
 
-    # ── Tool sequence check ───────────────────────────────────────────────
-    actual_tools = [step["tool"] for step in execution_trace]
+    actual_tools = [step.get("tool", "") for step in execution_trace]
 
     if actual_tools != expected_tools:
         details["tool_sequence_match"] = False
         details["missing_tools"] = [t for t in expected_tools if t not in actual_tools]
         details["extra_tools"] = [t for t in actual_tools if t not in expected_tools]
 
-    # Collect individual divergent steps already flagged by the adapter
     details["divergent_steps"] = [
         {
-            "step": step["step"],
-            "expected": step["expected_tool"],
-            "actual": step["tool"],
-            "reason": step["divergence_reason"],
+            "step": step.get("step"),
+            "expected": step.get("expected_tool"),
+            "actual": step.get("tool"),
+            "reason": step.get("divergence_reason"),
         }
         for step in execution_trace
         if step.get("is_divergence")
     ]
 
-    # ── Exact output check (optional) ────────────────────────────────────
     if expected_output is not None:
         details["output_match"] = expected_output.strip() == final_response.strip()
 
-    # ── Overall pass/fail ─────────────────────────────────────────────────
-    passed = (
-        details["tool_sequence_match"]
-        and not details["divergent_steps"]
-        and (details["output_match"] is not False)   # None means "not checked" → ok
-    )
+    # If no expected_tools were set, treat as pass (informational run only)
+    if not expected_tools:
+        passed = True
+    else:
+        passed = (
+            details["tool_sequence_match"]
+            and not details["divergent_steps"]
+            and (details["output_match"] is not False)
+        )
 
     return passed, details
 
 
 # ---------------------------------------------------------------------------
-# DB persistence helpers
+# DB helper
 # ---------------------------------------------------------------------------
 
-async def _persist_result(
-    session: AsyncSession,
+def _persist_result(
+    db: Any,
     run: Run,
     test_case: TestCase,
     model_name: str,
@@ -325,43 +260,29 @@ async def _persist_result(
     semantic_score: float | None,
     judge_explanation: str | None,
 ) -> TestResult:
+
+    # First divergence step index (1-based, None if no divergence)
+    divergence_step: int | None = None
+    for step in execution_trace:
+        if step.get("is_divergence"):
+            divergence_step = step.get("step", 0) + 1
+            break
+
     result = TestResult(
         run_id=run.id,
         test_case_id=test_case.id,
         model_used=model_name,
         final_response=final_response,
-        execution_trace=execution_trace,    # stored as JSON column
+        actual_response=final_response,
+        execution_trace=execution_trace,
         token_usage=token_usage,
         passed=passed,
+        divergence_step=divergence_step,
         assertion_details=assertion_details,
         semantic_score=semantic_score,
         judge_explanation=judge_explanation,
         created_at=datetime.now(timezone.utc),
     )
-    session.add(result)
-    await session.flush()
+    db.add(result)
+    db.flush()
     return result
-
-
-async def _fetch_run(session: AsyncSession, run_id: str) -> Run:
-    run = await session.get(Run, run_id)
-    if run is None:
-        raise ValueError(f"Run '{run_id}' not found in database.")
-    return run
-
-
-async def _fetch_suite(session: AsyncSession, suite_id: str) -> TestSuite:
-    suite = await session.get(TestSuite, suite_id)
-    if suite is None:
-        raise ValueError(f"TestSuite '{suite_id}' not found in database.")
-    return suite
-
-
-async def _fetch_test_cases(session: AsyncSession, suite_id: str) -> list[TestCase]:
-    from sqlalchemy import select
-    stmt = select(TestCase).where(TestCase.suite_id == suite_id).order_by(TestCase.id)
-    result = await session.execute(stmt)
-    cases = result.scalars().all()
-    if not cases:
-        raise ValueError(f"TestSuite '{suite_id}' has no test cases.")
-    return list(cases)

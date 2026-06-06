@@ -147,11 +147,10 @@ export default function DashboardPage() {
 
   async function handleRunSuite(suite: TestSuite) {
     try {
-      const { run_ids } = await api.startRun(suite.id, suite.models_to_test)
-      router.push(`/run/${run_ids[0]}`)
+      router.push(`/run/${suite.id}`)
     } catch (err) {
       console.error(err)
-      alert('Failed to start run. Check the console for details.')
+      alert('Failed to navigate to run page.')
     }
   }
 

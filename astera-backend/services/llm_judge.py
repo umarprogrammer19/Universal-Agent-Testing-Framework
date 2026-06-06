@@ -1,20 +1,33 @@
 """
 services/llm_judge.py
-LLM-as-a-Judge for semantic scoring of agent responses
+LLM-as-a-Judge for semantic scoring of agent responses using google-genai SDK.
 """
 
 import json
 import os
-import google.generativeai as genai
 
-# Configure Gemini
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+from google import genai
+from dotenv import load_dotenv
+
+load_dotenv()
+
+_client: genai.Client | None = None
+
+
+def _get_client() -> genai.Client:
+    global _client
+    if _client is None:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise EnvironmentError("GEMINI_API_KEY is not set.")
+        _client = genai.Client(api_key=api_key)
+    return _client
 
 
 async def judge_response(
     prompt: str,
     golden_response: str,
-    actual_response: str
+    actual_response: str,
 ) -> dict:
     """
     Score actual response against golden response using Gemini as judge.
@@ -50,29 +63,33 @@ Label rules:
 """
 
     try:
-        model = genai.GenerativeModel(model_name=os.getenv("GEMINI_JUDGE_MODEL", "gemini-2.0-flash"))
-        response = model.generate_content(judge_prompt)
+        import asyncio
+        client = _get_client()
+        model = os.getenv("GEMINI_JUDGE_MODEL", "gemini-2.0-flash")
+
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=model,
+            contents=judge_prompt,
+        )
 
         response_text = response.text.strip()
-        parsed = json.loads(response_text)
+        # Strip markdown fences if model wraps JSON anyway
+        if response_text.startswith("```"):
+            response_text = response_text.split("```")[1]
+            if response_text.startswith("json"):
+                response_text = response_text[4:]
 
+        parsed = json.loads(response_text)
         return {
             "score": float(parsed.get("score", 0)),
             "label": parsed.get("label", "Poor"),
-            "explanation": parsed.get("explanation", "Judge response parse error")
+            "explanation": parsed.get("explanation", "Judge response parse error"),
         }
 
     except json.JSONDecodeError:
         print("[ERROR] Judge JSON parse failed")
-        return {
-            "score": 0.0,
-            "label": "Poor",
-            "explanation": "Judge failed to parse response"
-        }
+        return {"score": 0.0, "label": "Poor", "explanation": "Judge failed to parse response"}
     except Exception as e:
-        print(f"[ERROR] Judge service error: {str(e)}")
-        return {
-            "score": 0.0,
-            "label": "Poor",
-            "explanation": f"Judge error: {str(e)}"
-        }
+        print(f"[ERROR] Judge service error: {e}")
+        return {"score": 0.0, "label": "Poor", "explanation": f"Judge error: {e}"}

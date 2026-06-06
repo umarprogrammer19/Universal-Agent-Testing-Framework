@@ -2,7 +2,8 @@ import os
 import asyncio
 from typing import Any
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
 from .base import BaseAgentAdapter
@@ -11,7 +12,7 @@ load_dotenv()
 
 
 class GeminiAdapter(BaseAgentAdapter):
-    """Adapter that wraps Google Gemini 2.0 Flash via the generativeai SDK."""
+    """Adapter that wraps Google Gemini 2.0 Flash via the google-genai SDK."""
 
     _MODEL_NAME = "gemini-2.0-flash"
     _DISPLAY_NAME = "Gemini 2.0 Flash"
@@ -20,7 +21,7 @@ class GeminiAdapter(BaseAgentAdapter):
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise EnvironmentError("GEMINI_API_KEY is not set in the environment / .env file.")
-        genai.configure(api_key=api_key)
+        self._client = genai.Client(api_key=api_key)
 
     async def get_model_name(self) -> str:
         return self._DISPLAY_NAME
@@ -29,15 +30,8 @@ class GeminiAdapter(BaseAgentAdapter):
         """
         Drive a Gemini agentic loop and return a normalised trace dict.
 
-        Parameters
-        ----------
-        prompt : str
-            The user message / task description.
-        tools : list
-            Each item may be a raw Gemini tool declaration (dict / FunctionDeclaration)
-            or a framework test-case object that carries an ``expected_tool`` field.
-            Objects that expose ``.expected_tool`` are used for divergence detection;
-            the underlying tool declaration is passed to the model.
+        tools: each item may carry an 'expected_tool' annotation for divergence
+        detection. The underlying tool declaration is passed to the model.
         """
         # Separate expected_tool annotations from actual Gemini tool declarations
         expected_tools: list[str] = []
@@ -53,29 +47,39 @@ class GeminiAdapter(BaseAgentAdapter):
                 expected_tools.append("")
                 gemini_tools.append(t)
 
-        model = genai.GenerativeModel(
-            model_name=self._MODEL_NAME,
+        config = types.GenerateContentConfig(
             tools=gemini_tools if gemini_tools else None,
         )
-
-        # SDK calls are synchronous; run them in a thread pool so we stay async-safe
-        chat = await asyncio.to_thread(model.start_chat)
 
         execution_trace: list[dict] = []
         step_counter = 0
         total_tokens = 0
 
-        response = await asyncio.to_thread(chat.send_message, prompt)
+        # Build conversation history manually (new SDK uses stateless calls)
+        contents: list[types.ContentUnion] = [
+            types.Content(role="user", parts=[types.Part(text=prompt)])
+        ]
 
         while True:
-            # Accumulate tokens reported so far
+            response = await asyncio.to_thread(
+                self._client.models.generate_content,
+                model=self._MODEL_NAME,
+                contents=contents,
+                config=config,
+            )
+
+            # Token accounting
             usage = getattr(response, "usage_metadata", None)
-            current_total = getattr(usage, "total_token_count", 0) if usage else 0
+            total_tokens = getattr(usage, "total_token_count", total_tokens) if usage else total_tokens
 
-            # Collect every function_call part in this response
+            # Append model turn to history
+            contents.append(response.candidates[0].content)
+
+            # Check for function calls in this response
             function_calls_found = False
+            tool_response_parts: list[types.Part] = []
 
-            for part in response.parts:
+            for part in response.candidates[0].content.parts:
                 fc = getattr(part, "function_call", None)
                 if fc is None:
                     continue
@@ -84,61 +88,44 @@ class GeminiAdapter(BaseAgentAdapter):
                 tool_name: str = fc.name
                 tool_params: dict = dict(fc.args) if fc.args else {}
 
-                # Tokens consumed up to and including this step
-                tokens_delta = current_total - total_tokens
-
-                # Divergence check against the ordered expected_tools list
                 expected = expected_tools[step_counter] if step_counter < len(expected_tools) else ""
+                mock_result = {"result": f"mock response for {tool_name}"}
 
                 trace_step = self._build_step(
                     step=step_counter,
                     tool=tool_name,
                     params=tool_params,
-                    response={},          # filled in below after mock call
-                    tokens_this_step=tokens_delta,
+                    response=mock_result,
+                    tokens_this_step=0,   # updated after full response round
                     expected_tool=expected,
                 )
-
-                # Send a mock function response so the agent loop can continue
-                mock_result = {"result": f"mock response for {tool_name}"}
-                function_response_part = genai.protos.Part(
-                    function_response=genai.protos.FunctionResponse(
-                        name=tool_name,
-                        response={"output": mock_result},
-                    )
-                )
-
-                response = await asyncio.to_thread(
-                    chat.send_message,
-                    genai.protos.Content(
-                        role="user",
-                        parts=[function_response_part],
-                    ),
-                )
-
-                # Update token delta now that we have the next response
-                new_usage = getattr(response, "usage_metadata", None)
-                new_total = getattr(new_usage, "total_token_count", 0) if new_usage else 0
-                trace_step["response"] = mock_result
-                trace_step["tokens_this_step"] = new_total - total_tokens
-                total_tokens = new_total
-
                 execution_trace.append(trace_step)
                 step_counter += 1
 
-            # No function calls in this response → the agent is done
-            if not function_calls_found:
-                # Capture any remaining tokens
-                final_usage = getattr(response, "usage_metadata", None)
-                total_tokens = (
-                    getattr(final_usage, "total_token_count", total_tokens)
-                    if final_usage
-                    else total_tokens
+                # Build mock function response part
+                tool_response_parts.append(
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            name=tool_name,
+                            response={"output": mock_result},
+                        )
+                    )
                 )
+
+            if not function_calls_found:
                 break
 
-        # Extract the final text answer
-        final_response = response.text if hasattr(response, "text") else ""
+            # Append all tool responses as a single user turn
+            contents.append(
+                types.Content(role="user", parts=tool_response_parts)
+            )
+
+        # Extract final text
+        final_response = ""
+        try:
+            final_response = response.text or ""
+        except Exception:
+            pass
 
         return self._build_result(
             final_response=final_response,
