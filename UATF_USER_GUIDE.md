@@ -8,7 +8,8 @@
 ```bash
 
 cd astera-backend
-uv run uvicorn main:app --reload --port 8000
+uv sync (make sure you have installed uv on your system)
+uvicorn main:app --reload --port 8000
 
 cd astera-frontend
 npm run dev
