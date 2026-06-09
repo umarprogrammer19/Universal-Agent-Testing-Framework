@@ -6,11 +6,10 @@
 ## Quick Start (Run Everything)
 
 ```bash
-# Terminal 1 — Backend
+
 cd astera-backend
 uv run uvicorn main:app --reload --port 8000
 
-# Terminal 2 — Frontend
 cd astera-frontend
 npm run dev
 ```
